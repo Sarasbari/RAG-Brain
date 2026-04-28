@@ -1,77 +1,51 @@
-import { getGroqClient, DEFAULT_MODEL } from "@/lib/groq";
-import type { SearchResult, RerankedResult } from "@/types";
+import { RetrievedChunk } from '@/types'
 
-/**
- * Reranks search results using LLM-based relevance scoring.
- * Uses Groq for fast inference. Falls back to original scores on error.
- */
+// Uses Cohere Rerank API — 1000 free calls/month
+// Cross-encoder: reads query + each document TOGETHER, much more accurate
+// than bi-encoder similarity scores
+
+const COHERE_RERANK_URL = 'https://api.cohere.com/v2/rerank'
+const TOP_N = 6   // how many to keep after reranking
+
 export async function rerank(
   query: string,
-  results: SearchResult[],
-  topK: number = 10
-): Promise<RerankedResult[]> {
-  if (results.length === 0) return [];
-  if (results.length <= topK) {
-    return results.map((r) => ({
-      ...r,
-      originalScore: r.score,
-      rerankedScore: r.score,
-    }));
+  chunks: RetrievedChunk[]
+): Promise<RetrievedChunk[]> {
+  // Skip reranking if not enough chunks or no API key
+  if (chunks.length <= 3) return chunks
+  if (!process.env.COHERE_API_KEY) {
+    console.warn('⚠️  No COHERE_API_KEY — skipping rerank, using top-6 by score')
+    return chunks.slice(0, TOP_N)
   }
 
   try {
-    const groq = getGroqClient();
+    const res = await fetch(COHERE_RERANK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.COHERE_API_KEY}`,
+        'X-Client-Name': 'production-rag',
+      },
+      body: JSON.stringify({
+        model: 'rerank-v3.5',
+        query,
+        documents: chunks.map((c) => c.content),
+        top_n: TOP_N,
+        return_documents: false,
+      }),
+    })
 
-    // Score each result for relevance using the LLM
-    const scoringPrompt = buildScoringPrompt(query, results);
+    if (!res.ok) throw new Error(await res.text())
 
-    const response = await groq.chat.completions.create({
-      model: DEFAULT_MODEL,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a relevance scoring system. Given a query and document passages, rate each passage's relevance from 0.0 to 1.0. Return ONLY a JSON array of numbers, one score per passage, in the same order.",
-        },
-        { role: "user", content: scoringPrompt },
-      ],
-      temperature: 0,
-      max_tokens: 512,
-    });
+    const data = await res.json()
 
-    const scoresText = response.choices[0]?.message?.content ?? "[]";
-    const scores: number[] = JSON.parse(scoresText);
-
-    // Combine with original results
-    const reranked: RerankedResult[] = results.map((result, i) => ({
-      ...result,
-      originalScore: result.score,
-      rerankedScore: scores[i] ?? result.score,
-    }));
-
-    // Sort by reranked score and take top K
-    return reranked
-      .sort((a, b) => b.rerankedScore - a.rerankedScore)
-      .slice(0, topK);
-  } catch (error) {
-    console.warn("⚠️  Reranking failed, using original scores:", error);
-    return results.slice(0, topK).map((r) => ({
-      ...r,
-      originalScore: r.score,
-      rerankedScore: r.score,
-    }));
+    // Map reranked indices back to original chunks with new scores
+    return data.results.map((r: any) => ({
+      ...chunks[r.index],
+      score: r.relevance_score,
+    }))
+  } catch (err) {
+    console.warn(`⚠️  Rerank failed: ${(err as Error).message} — using original order`)
+    return chunks.slice(0, TOP_N)
   }
-}
-
-// ─── Helpers ───────────────────────────────────────────────────────
-
-function buildScoringPrompt(query: string, results: SearchResult[]): string {
-  const passages = results
-    .map(
-      (r, i) =>
-        `[Passage ${i + 1}] (source: ${r.metadata.title})\n${r.content.slice(0, 300)}`
-    )
-    .join("\n\n");
-
-  return `Query: "${query}"\n\nPassages:\n${passages}\n\nReturn a JSON array of ${results.length} relevance scores (0.0–1.0):`;
 }

@@ -1,111 +1,162 @@
-import { Client } from "@notionhq/client";
-import type { RawDocument } from "@/types";
+import { Client } from '@notionhq/client'
+import {
+  PageObjectResponse,
+  BlockObjectResponse,
+} from '@notionhq/client/build/src/api-endpoints'
+import { RawDocument } from '@/types'
 
-let notion: Client | null = null;
+const notion = new Client({ auth: process.env.NOTION_API_KEY })
 
-function getNotionClient(): Client {
-  if (!notion) {
-    notion = new Client({ auth: process.env.NOTION_API_KEY! });
+// ─── Block → Markdown ────────────────────────────────────────────────────────
+
+function blockToMarkdown(block: BlockObjectResponse): string {
+  const b = block as any
+
+  switch (block.type) {
+    case 'paragraph':
+      return extractRichText(b.paragraph.rich_text) + '\n\n'
+    case 'heading_1':
+      return `# ${extractRichText(b.heading_1.rich_text)}\n\n`
+    case 'heading_2':
+      return `## ${extractRichText(b.heading_2.rich_text)}\n\n`
+    case 'heading_3':
+      return `### ${extractRichText(b.heading_3.rich_text)}\n\n`
+    case 'bulleted_list_item':
+      return `- ${extractRichText(b.bulleted_list_item.rich_text)}\n`
+    case 'numbered_list_item':
+      return `1. ${extractRichText(b.numbered_list_item.rich_text)}\n`
+    case 'to_do':
+      const checked = b.to_do.checked ? '[x]' : '[ ]'
+      return `- ${checked} ${extractRichText(b.to_do.rich_text)}\n`
+    case 'toggle':
+      return extractRichText(b.toggle.rich_text) + '\n\n'
+    case 'code':
+      const lang = b.code.language || ''
+      return `\`\`\`${lang}\n${extractRichText(b.code.rich_text)}\n\`\`\`\n\n`
+    case 'quote':
+      return `> ${extractRichText(b.quote.rich_text)}\n\n`
+    case 'callout':
+      return `> ${extractRichText(b.callout.rich_text)}\n\n`
+    case 'divider':
+      return `---\n\n`
+    case 'table_of_contents':
+      return ''
+    default:
+      return ''
   }
-  return notion;
 }
 
-/**
- * Fetches all pages from the configured Notion workspace.
- * Uses the Notion search API to discover pages, then retrieves
- * their block content as plain text.
- */
-export async function fetchNotionDocuments(
-  cursor?: string
-): Promise<{ documents: RawDocument[]; nextCursor?: string }> {
-  const client = getNotionClient();
-  const documents: RawDocument[] = [];
-
-  const response = await client.search({
-    filter: { property: "object", value: "page" },
-    start_cursor: cursor,
-    page_size: 100,
-  });
-
-  for (const page of response.results) {
-    if (page.object !== "page" || !("properties" in page)) continue;
-
-    const blocks = await fetchPageBlocks(client, page.id);
-    const content = blocksToText(blocks);
-    const title = extractTitle(page);
-
-    if (!content.trim()) continue;
-
-    documents.push({
-      id: `notion-${page.id}`,
-      sourceType: "notion",
-      sourceId: page.id,
-      title,
-      content,
-      url: (page as Record<string, unknown>).url as string | undefined,
-      lastModified: new Date(page.last_edited_time),
-      metadata: {
-        createdTime: page.created_time,
-        parentType: (page as Record<string, unknown>).parent
-          ? ((page as Record<string, unknown>).parent as Record<string, unknown>).type
-          : undefined,
-      },
-    });
-  }
-
-  return {
-    documents,
-    nextCursor: response.has_more ? response.next_cursor ?? undefined : undefined,
-  };
+function extractRichText(richText: any[]): string {
+  if (!richText) return ''
+  return richText.map((t) => t.plain_text).join('')
 }
 
-// ─── Helpers ───────────────────────────────────────────────────────
+// ─── Fetch all blocks recursively (handles nested toggles etc.) ──────────────
 
-async function fetchPageBlocks(
-  client: Client,
-  pageId: string
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-): Promise<any[]> {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const blocks: any[] = [];
-  let cursor: string | undefined;
+async function fetchBlocks(blockId: string): Promise<string> {
+  let markdown = ''
+  let cursor: string | undefined
 
   do {
-    const response = await client.blocks.children.list({
-      block_id: pageId,
+    const response = await notion.blocks.children.list({
+      block_id: blockId,
       start_cursor: cursor,
       page_size: 100,
-    });
-    blocks.push(...response.results);
-    cursor = response.has_more ? response.next_cursor ?? undefined : undefined;
-  } while (cursor);
-
-  return blocks;
-}
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function blocksToText(blocks: any[]): string {
-  return blocks
-    .map((block) => {
-      const type = block.type;
-      const content = block[type];
-      if (!content?.rich_text) return "";
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return content.rich_text.map((t: any) => t.plain_text).join("");
     })
-    .filter(Boolean)
-    .join("\n\n");
+
+    for (const block of response.results as BlockObjectResponse[]) {
+      markdown += blockToMarkdown(block)
+
+      // Recurse into children (nested toggles, synced blocks, etc.)
+      if ((block as any).has_children) {
+        markdown += await fetchBlocks(block.id)
+      }
+    }
+
+    cursor = response.next_cursor ?? undefined
+  } while (cursor)
+
+  return markdown
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function extractTitle(page: any): string {
-  const properties = page.properties;
-  for (const key of Object.keys(properties)) {
-    const prop = properties[key];
-    if (prop.type === "title" && prop.title?.length > 0) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      return prop.title.map((t: any) => t.plain_text).join("");
+// ─── Fetch all pages recursively via search ──────────────────────────────────
+
+async function fetchAllPages(): Promise<PageObjectResponse[]> {
+  const pages: PageObjectResponse[] = []
+  let cursor: string | undefined
+
+  do {
+    const response = await notion.search({
+      filter: { property: 'object', value: 'page' },
+      start_cursor: cursor,
+      page_size: 100,
+    })
+
+    for (const result of response.results) {
+      if (result.object === 'page') {
+        pages.push(result as PageObjectResponse)
+      }
+    }
+
+    cursor = response.next_cursor ?? undefined
+  } while (cursor)
+
+  return pages
+}
+
+// ─── Main export ─────────────────────────────────────────────────────────────
+
+export async function fetchNotionDocuments(
+  since?: string   // ISO string — only fetch pages edited after this date
+): Promise<RawDocument[]> {
+  console.log('📄 Fetching Notion pages...')
+  const pages = await fetchAllPages()
+
+  const documents: RawDocument[] = []
+
+  for (const page of pages) {
+    // Skip if not edited since last sync
+    if (since && page.last_edited_time <= since) continue
+
+    const props = page.properties as any
+
+    // Extract title — Notion stores it differently per page type
+    const titleProp =
+      props.title ?? props.Name ?? props.name ??
+      Object.values(props).find((p: any) => p.type === 'title')
+
+    const title = titleProp?.title
+      ?.map((t: any) => t.plain_text)
+      .join('') ?? 'Untitled'
+
+    const url = (page as any).url ?? 
+      `https://notion.so/${page.id.replace(/-/g, '')}`
+
+    const author =
+      page.created_by?.id ?? undefined
+
+    try {
+      const content = await fetchBlocks(page.id)
+
+      // Skip empty pages
+      if (content.trim().length < 50) continue
+
+      documents.push({
+        id: `notion-${page.id}`,
+        title,
+        content,
+        url,
+        source: 'notion',
+        lastEditedAt: page.last_edited_time,
+        author,
+      })
+
+      console.log(`  ✓ ${title}`)
+    } catch (err) {
+      console.warn(`  ✗ Skipped page ${title} — ${(err as Error).message}`)
     }
   }
-  return "Untitled";
+
+  console.log(`✅ Notion: ${documents.length} pages fetched\n`)
+  return documents
 }

@@ -1,60 +1,77 @@
-import { expandQuery } from "./expander";
-import { hybridSearch } from "./search";
-import { rerank } from "./reranker";
-import type { RetrievalContext, SearchResult } from "@/types";
+import { hybridSearch } from './search'
+import { rerank } from './reranker'
+import { rewriteQuery, expandQuery, generateHypotheticalDocument } from './expander'
+import { embedQuery } from '@/lib/voyage'
+import { RetrievedChunk, ChatMessage } from '@/types'
 
-const MAX_CONTEXT_TOKENS = 6000;
+export interface RetrievalOptions {
+  topK?: number
+  sourceFilter?: ('notion' | 'confluence' | 'slack')[]
+  useHyDE?: boolean          // default: true
+  useMultiQuery?: boolean    // default: true for complex queries
+  useRerank?: boolean        // default: true
+}
 
-/**
- * Full retrieval pipeline:
- * 1. Expand query → multiple search queries + HyDE
- * 2. Search Qdrant with each expanded query
- * 3. Deduplicate results
- * 4. Rerank with cross-encoder
- * 5. Trim to token budget
- */
-export async function retrieve(query: string): Promise<RetrievalContext> {
-  // Step 1: Expand query
-  const expandedQueries = await expandQuery(query);
-  console.log(`🔍 Expanded into ${expandedQueries.length} queries`);
+export async function retrieve(
+  query: string,
+  history: ChatMessage[],
+  options: RetrievalOptions = {}
+): Promise<RetrievedChunk[]> {
+  const {
+    topK = 6,
+    sourceFilter,
+    useHyDE = true,
+    useMultiQuery = true,
+    useRerank = true,
+  } = options
 
-  // Step 2: Search with each expanded query
-  const allResults: SearchResult[] = [];
+  // ── Step 1: Rewrite query to resolve conversation references ────────────────
+  const standaloneQuery = await rewriteQuery(query, history)
+  console.log(`🔄 Rewritten query: "${standaloneQuery}"`)
 
-  for (const eq of expandedQueries) {
-    const results = await hybridSearch(eq, 10);
-    allResults.push(...results);
+  // ── Step 2: Build search queries (original + expansions + HyDE) ─────────────
+  const searchQueries: string[] = [standaloneQuery]
+
+  if (useMultiQuery && standaloneQuery.split(' ').length > 4) {
+    const expanded = await expandQuery(standaloneQuery)
+    searchQueries.push(...expanded.slice(1))   // add rephrasings, not the original again
   }
 
-  // Step 3: Deduplicate by chunk ID
-  const seen = new Set<string>();
-  const uniqueResults = allResults.filter((r) => {
-    if (seen.has(r.id)) return false;
-    seen.add(r.id);
-    return true;
-  });
+  if (useHyDE) {
+    const hypothetical = await generateHypotheticalDocument(standaloneQuery)
+    searchQueries.push(hypothetical)
+    console.log(`💭 HyDE doc: "${hypothetical.slice(0, 80)}..."`)
+  }
 
-  console.log(
-    `📊 ${allResults.length} total results → ${uniqueResults.length} unique`
-  );
+  // ── Step 3: Run hybrid search for each query in parallel ────────────────────
+  const searchResults = await Promise.all(
+    searchQueries.map((q) =>
+      hybridSearch(q, { topK: 15, sourceFilter })
+    )
+  )
 
-  // Step 4: Rerank
-  const reranked = await rerank(query, uniqueResults, 15);
-  console.log(`🏆 Reranked to top ${reranked.length} results`);
+  // ── Step 4: Deduplicate across all query results ─────────────────────────────
+  const seen = new Set<string>()
+  const allChunks: RetrievedChunk[] = []
 
-  // Step 5: Trim to token budget
-  let totalTokens = 0;
-  const trimmedResults = reranked.filter((r) => {
-    const tokens = Math.ceil(r.content.length / 4);
-    if (totalTokens + tokens > MAX_CONTEXT_TOKENS) return false;
-    totalTokens += tokens;
-    return true;
-  });
+  for (const results of searchResults) {
+    for (const chunk of results) {
+      const key = chunk.content.slice(0, 100)
+      if (!seen.has(key)) {
+        seen.add(key)
+        allChunks.push(chunk)
+      }
+    }
+  }
 
-  return {
-    query,
-    expandedQueries,
-    results: trimmedResults,
-    totalTokens,
-  };
+  console.log(`🔍 Retrieved ${allChunks.length} unique chunks across ${searchQueries.length} queries`)
+
+  // ── Step 5: Rerank the merged pool ───────────────────────────────────────────
+  if (useRerank && allChunks.length > topK) {
+    const reranked = await rerank(standaloneQuery, allChunks)
+    console.log(`🏅 Reranked to top ${reranked.length} chunks`)
+    return reranked
+  }
+
+  return allChunks.slice(0, topK)
 }

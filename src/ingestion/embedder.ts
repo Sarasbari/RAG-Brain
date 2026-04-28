@@ -1,78 +1,61 @@
-import { getVoyageClient, VOYAGE_MODEL } from "@/lib/voyage";
-import { getQdrantClient, COLLECTION_NAME, ensureCollection } from "@/lib/qdrant";
-import type { Chunk, EmbeddedChunk } from "@/types";
+import { EmbeddedChunk, Chunk } from '@/types'
 
-const BATCH_SIZE = 128; // Voyage AI max batch size
+const VOYAGE_API_URL = 'https://api.voyageai.com/v1/embeddings'
+const MODEL = 'voyage-3-lite'   // free tier model, 1024 dimensions
+const BATCH_SIZE = 128           // Voyage AI max batch size
 
-/**
- * Generates embeddings for chunks via Voyage AI and upserts them to Qdrant.
- * Processes in batches to respect API limits.
- */
-export async function embedAndStore(chunks: Chunk[]): Promise<number> {
-  await ensureCollection();
-
-  const voyage = getVoyageClient();
-  const qdrant = getQdrantClient();
-  let totalEmbedded = 0;
-
-  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
-    const batch = chunks.slice(i, i + BATCH_SIZE);
-    const texts = batch.map((c) => c.content);
-
-    // Generate embeddings
-    const response = await voyage.embed({
+async function embedBatch(texts: string[]): Promise<number[][]> {
+  const res = await fetch(VOYAGE_API_URL, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.VOYAGE_API_KEY}`,
+    },
+    body: JSON.stringify({
       input: texts,
-      model: VOYAGE_MODEL,
-      input_type: "document",
-    });
+      model: MODEL,
+      input_type: 'document',   // use 'query' at query time
+    }),
+  })
 
-    // Combine chunks with their embeddings
-    const embeddedChunks: EmbeddedChunk[] = batch.map((chunk, idx) => ({
-      ...chunk,
-      embedding: response.data[idx].embedding,
-    }));
-
-    // Upsert to Qdrant
-    await qdrant.upsert(COLLECTION_NAME, {
-      wait: true,
-      points: embeddedChunks.map((ec) => ({
-        id: ec.id,
-        vector: ec.embedding,
-        payload: {
-          content: ec.content,
-          documentId: ec.documentId,
-          sourceType: ec.metadata.sourceType,
-          sourceId: ec.metadata.sourceId,
-          title: ec.metadata.title,
-          url: ec.metadata.url ?? "",
-          author: ec.metadata.author ?? "",
-          lastModified: ec.metadata.lastModified,
-          chunkIndex: ec.metadata.chunkIndex,
-          totalChunks: ec.metadata.totalChunks,
-        },
-      })),
-    });
-
-    totalEmbedded += batch.length;
-    console.log(
-      `  📦 Embedded batch ${Math.floor(i / BATCH_SIZE) + 1}: ${batch.length} chunks`
-    );
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Voyage AI error: ${err}`)
   }
 
-  return totalEmbedded;
+  const data = await res.json()
+
+  // Voyage returns embeddings in same order as input
+  return data.data.map((d: any) => d.embedding)
 }
 
-/**
- * Generates a query embedding for retrieval.
- */
-export async function embedQuery(query: string): Promise<number[]> {
-  const voyage = getVoyageClient();
+export async function embedChunks(
+  chunks: Chunk[]
+): Promise<EmbeddedChunk[]> {
+  console.log(`🔢 Embedding ${chunks.length} chunks via Voyage AI...`)
 
-  const response = await voyage.embed({
-    input: query,
-    model: VOYAGE_MODEL,
-    input_type: "query",
-  });
+  const embedded: EmbeddedChunk[] = []
 
-  return response.data[0].embedding;
+  // Process in batches to respect rate limits
+  for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+    const batch = chunks.slice(i, i + BATCH_SIZE)
+    const texts = batch.map((c) => c.content)
+
+    const embeddings = await embedBatch(texts)
+
+    batch.forEach((chunk, j) => {
+      embedded.push({ ...chunk, embedding: embeddings[j] })
+    })
+
+    const progress = Math.min(i + BATCH_SIZE, chunks.length)
+    console.log(`  ${progress}/${chunks.length} chunks embedded`)
+
+    // Small delay to avoid rate limit on free tier
+    if (i + BATCH_SIZE < chunks.length) {
+      await new Promise((r) => setTimeout(r, 200))
+    }
+  }
+
+  console.log(`✅ Embedding complete\n`)
+  return embedded
 }

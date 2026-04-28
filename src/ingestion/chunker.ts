@@ -1,61 +1,48 @@
-import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
-import type { RawDocument, Chunk, ChunkMetadata } from "@/types";
-import { randomUUID } from "crypto";
+import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters'
+import { RawDocument, Chunk } from '@/types'
+import { v4 as uuid } from 'uuid'
 
-const CHUNK_SIZE = 512;
-const CHUNK_OVERLAP = 64;
+// Install uuid: npm install uuid @types/uuid
 
 const splitter = new RecursiveCharacterTextSplitter({
-  chunkSize: CHUNK_SIZE,
-  chunkOverlap: CHUNK_OVERLAP,
-  separators: ["\n\n", "\n", ". ", " ", ""],
-});
+  chunkSize: 1024,      // tokens ≈ chars / 4 — 1024 chars ≈ 256 tokens
+  chunkOverlap: 128,    // 12.5% overlap to avoid cutting context at boundaries
+  separators: [
+    '\n## ', '\n### ', '\n#### ',  // prefer splitting at headings
+    '\n\n',                         // then paragraphs
+    '\n',                           // then lines
+    ' ',                            // then words
+    '',                             // last resort: chars
+  ],
+})
 
-/**
- * Splits a raw document into overlapping chunks.
- * Each chunk retains metadata from the parent document.
- */
-export async function chunkDocument(doc: RawDocument): Promise<Chunk[]> {
-  const textChunks = await splitter.splitText(doc.content);
+export async function chunkDocuments(
+  documents: RawDocument[]
+): Promise<Chunk[]> {
+  console.log(`✂️  Chunking ${documents.length} documents...`)
 
-  return textChunks.map((text, index) => {
-    const metadata: ChunkMetadata = {
-      sourceType: doc.sourceType,
-      sourceId: doc.sourceId,
-      title: doc.title,
-      url: doc.url,
-      author: doc.author,
-      lastModified: doc.lastModified.toISOString(),
-      chunkIndex: index,
-      totalChunks: textChunks.length,
-    };
+  const chunks: Chunk[] = []
 
-    return {
-      id: randomUUID(),
-      documentId: doc.id,
-      content: text,
-      tokenCount: estimateTokenCount(text),
-      index,
-      metadata,
-    };
-  });
-}
+  for (const doc of documents) {
+    const texts = await splitter.splitText(doc.content)
 
-/**
- * Batch-chunk multiple documents.
- */
-export async function chunkDocuments(docs: RawDocument[]): Promise<Chunk[]> {
-  const allChunks: Chunk[] = [];
-  for (const doc of docs) {
-    const chunks = await chunkDocument(doc);
-    allChunks.push(...chunks);
+    texts.forEach((text, index) => {
+      chunks.push({
+        id: `${doc.id}-chunk-${index}`,
+        docId: doc.id,
+        content: text,
+        metadata: {
+          title: doc.title,
+          url: doc.url,
+          source: doc.source,
+          author: doc.author,
+          lastEditedAt: doc.lastEditedAt,
+          chunkIndex: index,
+        },
+      })
+    })
   }
-  return allChunks;
-}
 
-// ─── Helpers ───────────────────────────────────────────────────────
-
-/** Rough token estimate (~4 chars per token for English) */
-function estimateTokenCount(text: string): number {
-  return Math.ceil(text.length / 4);
+  console.log(`✅ Created ${chunks.length} chunks\n`)
+  return chunks
 }
