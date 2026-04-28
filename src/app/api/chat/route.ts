@@ -1,94 +1,129 @@
-import { NextRequest, NextResponse } from "next/server";
-import { retrieve } from "@/retrieval/retriever";
-import { generateStreamingResponse, generateResponse } from "@/llm/generator";
-import { getLangfuse, flushLangfuse } from "@/lib/langfuse";
-import type { ChatRequest } from "@/types";
+import { NextRequest } from 'next/server'
+import { retrieve } from '@/retrieval/retriever'
+import { generateStreamingAnswer } from '@/llm/generator'
+import { extractCitations } from '@/llm/prompts'
+import { langfuse, flushLangfuse } from '@/lib/langfuse'
+import { db } from '@/db/client'
+import { queryLog } from '@/db/schema'
+import { ChatMessage } from '@/types'
+import { randomUUID } from 'crypto'
 
-export const runtime = "nodejs";
-export const maxDuration = 60;
+export const runtime = 'nodejs'
+export const maxDuration = 60
 
-export async function POST(request: NextRequest) {
+export async function POST(req: NextRequest) {
+  const startTime = Date.now()
+  const queryId = randomUUID()
+
+  const body = await req.json()
+  const {
+    query,
+    history = [],
+    sourceFilter,
+  }: {
+    query: string
+    history: ChatMessage[]
+    sourceFilter?: ('notion' | 'confluence' | 'slack')[]
+  } = body
+
+  if (!query?.trim()) {
+    return new Response('Query is required', { status: 400 })
+  }
+
+  // ── Start Langfuse trace ────────────────────────────────────────────────────
+  const trace = langfuse.trace({
+    id: queryId,
+    name: 'rag-query',
+    input: query,
+    metadata: { sourceFilter, historyLength: history.length },
+  })
+
   try {
-    const body: ChatRequest = await request.json();
-    const { messages, stream = true } = body;
+    // ── Span: Retrieval ───────────────────────────────────────────────────────
+    const retrievalSpan = trace.span({
+      name: 'retrieval',
+      input: { query, sourceFilter },
+    })
 
-    if (!messages || messages.length === 0) {
-      return NextResponse.json(
-        { error: "Messages array is required" },
-        { status: 400 }
-      );
-    }
+    const chunks = await retrieve(query, history, {
+      sourceFilter,
+      useHyDE: true,
+      useMultiQuery: true,
+      useRerank: true,
+    })
 
-    const lastMessage = messages[messages.length - 1];
-    if (lastMessage.role !== "user") {
-      return NextResponse.json(
-        { error: "Last message must be from user" },
-        { status: 400 }
-      );
-    }
-
-    // Start Langfuse trace
-    const langfuse = getLangfuse();
-    const trace = langfuse.trace({
-      name: "rag-chat",
-      input: lastMessage.content,
-    });
-
-    // Step 1: Retrieve relevant context
-    const retrievalSpan = trace.span({ name: "retrieval" });
-    const context = await retrieve(lastMessage.content);
     retrievalSpan.end({
       output: {
-        resultCount: context.results.length,
-        totalTokens: context.totalTokens,
-        expandedQueries: context.expandedQueries,
+        chunksRetrieved: chunks.length,
+        sources: [...new Set(chunks.map((c) => c.metadata.source))],
+        topScore: chunks[0]?.score,
+        titles: chunks.map((c) => c.metadata.title),
       },
-    });
+    })
 
-    // Step 2: Generate response
-    const generationSpan = trace.span({ name: "generation" });
+    const citations = extractCitations(chunks)
 
-    if (stream) {
-      const responseStream = await generateStreamingResponse(
-        messages,
-        context.results
-      );
+    // ── Span: LLM Generation ──────────────────────────────────────────────────
+    const generationSpan = trace.generation({
+      name: 'llm-generation',
+      model: 'llama-3.3-70b-versatile',
+      input: { query, chunksInContext: chunks.length },
+    })
 
-      generationSpan.end({ output: { streamed: true } });
-      await flushLangfuse();
+    const stream = generateStreamingAnswer(query, chunks, history)
+    const response = stream.toDataStreamResponse()
 
-      return new Response(responseStream, {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          Connection: "keep-alive",
-          "X-Trace-Id": trace.id,
-        },
-      });
-    }
+    // Collect full response text for Langfuse (async, doesn't block stream)
+    let fullResponse = ''
+    const [streamForClient, streamForLogging] = response.body!.tee()
 
-    // Non-streaming response
-    const responseText = await generateResponse(messages, context.results);
-    generationSpan.end({ output: responseText });
+    // Log to DB
+    const responseTimeMs = Date.now() - startTime
+    db.insert(queryLog)
+      .values({
+        id: queryId,
+        query,
+        chunksRetrieved: chunks.length,
+        sources: [...new Set(chunks.map((c) => c.metadata.source))],
+        responseTimeMs,
+        langfuseTraceId: queryId,
+      })
+      .catch(console.warn)   // non-blocking
 
-    trace.update({ output: responseText });
-    await flushLangfuse();
+    // End generation span + trace after stream completes (non-blocking)
+    ;(async () => {
+      const reader = streamForLogging.getReader()
+      const decoder = new TextDecoder()
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        const text = decoder.decode(value)
+        const lines = text.split('\n')
+        for (const line of lines) {
+          if (line.startsWith('0:')) {
+            try { fullResponse += JSON.parse(line.slice(2)) } catch {}
+          }
+        }
+      }
 
-    return NextResponse.json({
-      message: { role: "assistant", content: responseText },
-      sources: context.results.map((r) => ({
-        title: r.metadata.title,
-        url: r.metadata.url,
-        sourceType: r.metadata.sourceType,
-        relevanceScore: r.rerankedScore,
-      })),
-      traceId: trace.id,
-    });
-  } catch (error) {
-    console.error("Chat API error:", error);
-    return NextResponse.json(
-      { error: "Internal server error" },
-      { status: 500 }
-    );
+      generationSpan.end({ output: fullResponse })
+      trace.update({ output: fullResponse })
+      await flushLangfuse()
+    })()
+
+    const headers = new Headers(response.headers)
+    headers.set('X-Citations', JSON.stringify(citations))
+    headers.set('X-Query-Id', queryId)
+    headers.set('Access-Control-Expose-Headers', 'X-Citations, X-Query-Id')
+
+    return new Response(streamForClient, {
+      status: response.status,
+      headers,
+    })
+  } catch (err) {
+    trace.update({ output: `Error: ${(err as Error).message}` })
+    await flushLangfuse()
+    console.error('Chat API error:', err)
+    return new Response('Internal server error', { status: 500 })
   }
 }

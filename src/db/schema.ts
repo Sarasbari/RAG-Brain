@@ -1,56 +1,64 @@
 import {
   pgTable,
-  serial,
   text,
   timestamp,
   integer,
-  pgEnum,
-} from "drizzle-orm/pg-core";
+  boolean,
+  jsonb,
+  varchar,
+  index,
+} from 'drizzle-orm/pg-core'
 
-// ─── Enums ─────────────────────────────────────────────────────────
+// ─── Sync state — tracks last successful sync per source ─────────────────────
 
-export const sourceTypeEnum = pgEnum("source_type", [
-  "notion",
-  "confluence",
-  "slack",
-]);
-
-export const syncStatusEnum = pgEnum("sync_status", [
-  "idle",
-  "syncing",
-  "error",
-]);
-
-// ─── Sync State ────────────────────────────────────────────────────
-
-export const syncState = pgTable("sync_state", {
-  id: serial("id").primaryKey(),
-  sourceType: sourceTypeEnum("source_type").notNull(),
-  lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
-  lastCursor: text("last_cursor"),
-  documentCount: integer("document_count").notNull().default(0),
-  status: syncStatusEnum("status").notNull().default("idle"),
-  errorMessage: text("error_message"),
-  createdAt: timestamp("created_at", { withTimezone: true })
+export const syncState = pgTable('sync_state', {
+  id: varchar('id', { length: 50 }).primaryKey(),  // e.g. "notion", "confluence", "slack"
+  lastSyncedAt: timestamp('last_synced_at').notNull(),
+  lastSyncStatus: varchar('last_sync_status', { length: 20 })
     .notNull()
-    .defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+    .default('success'),          // 'success' | 'failed' | 'running'
+  documentsIndexed: integer('documents_indexed').notNull().default(0),
+  chunksIndexed: integer('chunks_indexed').notNull().default(0),
+  errorMessage: text('error_message'),
+  updatedAt: timestamp('updated_at').defaultNow(),
+})
 
-// ─── Ingested Documents (metadata only) ────────────────────────────
+// ─── Query analytics — every question asked + quality signals ─────────────────
 
-export const ingestedDocuments = pgTable("ingested_documents", {
-  id: serial("id").primaryKey(),
-  sourceType: sourceTypeEnum("source_type").notNull(),
-  sourceId: text("source_id").notNull().unique(),
-  title: text("title").notNull(),
-  url: text("url"),
-  contentHash: text("content_hash").notNull(),
-  chunkCount: integer("chunk_count").notNull().default(0),
-  lastModified: timestamp("last_modified", { withTimezone: true }),
-  ingestedAt: timestamp("ingested_at", { withTimezone: true })
-    .notNull()
-    .defaultNow(),
-});
+export const queryLog = pgTable(
+  'query_log',
+  {
+    id: varchar('id', { length: 100 }).primaryKey(),
+    query: text('query').notNull(),
+    rewrittenQuery: text('rewritten_query'),
+    chunksRetrieved: integer('chunks_retrieved').notNull().default(0),
+    sources: jsonb('sources'),                 // ["notion", "slack"]
+    responseTimeMs: integer('response_time_ms'),
+    thumbsUp: boolean('thumbs_up'),            // user feedback
+    langfuseTraceId: varchar('langfuse_trace_id', { length: 100 }),
+    createdAt: timestamp('created_at').defaultNow(),
+  },
+  (t) => ({
+    createdAtIdx: index('query_log_created_at_idx').on(t.createdAt),
+  })
+)
+
+// ─── Document registry — tracks every indexed doc for deletion sync ───────────
+
+export const documentRegistry = pgTable(
+  'document_registry',
+  {
+    id: varchar('id', { length: 200 }).primaryKey(),  // e.g. "notion-<pageId>"
+    source: varchar('source', { length: 20 }).notNull(),
+    title: text('title').notNull(),
+    url: text('url').notNull(),
+    lastEditedAt: timestamp('last_edited_at').notNull(),
+    chunkCount: integer('chunk_count').notNull().default(0),
+    qdrantPointIds: jsonb('qdrant_point_ids'),  // array of point IDs for cleanup
+    indexedAt: timestamp('indexed_at').defaultNow(),
+  },
+  (t) => ({
+    sourceIdx: index('doc_registry_source_idx').on(t.source),
+    lastEditedIdx: index('doc_registry_last_edited_idx').on(t.lastEditedAt),
+  })
+)

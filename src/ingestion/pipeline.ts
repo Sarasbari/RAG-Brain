@@ -4,7 +4,10 @@ import { fetchSlackDocuments } from './sources/slack'
 import { chunkDocuments } from './chunker'
 import { embedChunks } from './embedder'
 import { qdrant, COLLECTION_NAME, ensureCollection } from '@/lib/qdrant'
-import { EmbeddedChunk } from '@/types'
+import { db } from '@/db/client'
+import { syncState, documentRegistry } from '@/db/schema'
+import { eq } from 'drizzle-orm'
+import { EmbeddedChunk, SourceType } from '@/types'
 
 const UPSERT_BATCH_SIZE = 100
 
@@ -17,7 +20,7 @@ async function upsertToQdrant(chunks: EmbeddedChunk[]) {
     await qdrant.upsert(COLLECTION_NAME, {
       wait: true,
       points: batch.map((chunk) => ({
-        id: hashId(chunk.id),          // Qdrant needs numeric or UUID ids
+        id: hashId(chunk.id),
         vector: chunk.embedding,
         payload: {
           content: chunk.content,
@@ -28,15 +31,11 @@ async function upsertToQdrant(chunks: EmbeddedChunk[]) {
       })),
     })
 
-    console.log(
-      `  Upserted ${Math.min(i + UPSERT_BATCH_SIZE, chunks.length)}/${chunks.length}`
-    )
+    const progress = Math.min(i + UPSERT_BATCH_SIZE, chunks.length)
+    console.log(`  Upserted ${progress}/${chunks.length}`)
   }
-
-  console.log(`✅ Upsert complete\n`)
 }
 
-// Deterministic string → positive integer for Qdrant point IDs
 function hashId(str: string): number {
   let hash = 0
   for (let i = 0; i < str.length; i++) {
@@ -45,50 +44,164 @@ function hashId(str: string): number {
   return Math.abs(hash)
 }
 
+// ─── Get last sync time from DB ───────────────────────────────────────────────
+
+export async function getLastSyncTime(
+  source: SourceType
+): Promise<string | undefined> {
+  const row = await db
+    .select()
+    .from(syncState)
+    .where(eq(syncState.id, source))
+    .limit(1)
+
+  return row[0]?.lastSyncedAt?.toISOString()
+}
+
+// ─── Save sync result to DB ───────────────────────────────────────────────────
+
+async function saveSyncState(
+  source: SourceType,
+  status: 'success' | 'failed',
+  stats: { documents: number; chunks: number },
+  error?: string
+) {
+  await db
+    .insert(syncState)
+    .values({
+      id: source,
+      lastSyncedAt: new Date(),
+      lastSyncStatus: status,
+      documentsIndexed: stats.documents,
+      chunksIndexed: stats.chunks,
+      errorMessage: error,
+    })
+    .onConflictDoUpdate({
+      target: syncState.id,
+      set: {
+        lastSyncedAt: new Date(),
+        lastSyncStatus: status,
+        documentsIndexed: stats.documents,
+        chunksIndexed: stats.chunks,
+        errorMessage: error ?? null,
+        updatedAt: new Date(),
+      },
+    })
+}
+
+// ─── Register documents in DB for future deletion tracking ───────────────────
+
+async function registerDocuments(chunks: EmbeddedChunk[]) {
+  // Group chunks by docId
+  const docMap = new Map<string, EmbeddedChunk[]>()
+  for (const chunk of chunks) {
+    const arr = docMap.get(chunk.docId) ?? []
+    arr.push(chunk)
+    docMap.set(chunk.docId, arr)
+  }
+
+  for (const [docId, docChunks] of docMap.entries()) {
+    const first = docChunks[0]
+    await db
+      .insert(documentRegistry)
+      .values({
+        id: docId,
+        source: first.metadata.source,
+        title: first.metadata.title,
+        url: first.metadata.url,
+        lastEditedAt: new Date(first.metadata.lastEditedAt),
+        chunkCount: docChunks.length,
+        qdrantPointIds: docChunks.map((c) => hashId(c.id)),
+        indexedAt: new Date(),
+      })
+      .onConflictDoUpdate({
+        target: documentRegistry.id,
+        set: {
+          lastEditedAt: new Date(first.metadata.lastEditedAt),
+          chunkCount: docChunks.length,
+          qdrantPointIds: docChunks.map((c) => hashId(c.id)),
+          indexedAt: new Date(),
+        },
+      })
+  }
+}
+
 // ─── Main pipeline ────────────────────────────────────────────────────────────
 
 export async function runPipeline(options: {
-  sources?: ('notion' | 'confluence' | 'slack')[]
-  since?: string   // ISO date for incremental sync
+  sources?: SourceType[]
+  since?: string
+  incremental?: boolean   // if true, auto-reads last sync time from DB
 }) {
-  const { sources = ['notion', 'confluence', 'slack'], since } = options
+  const {
+    sources = ['notion', 'confluence', 'slack'],
+    incremental = false,
+  } = options
 
   console.log('🚀 Starting ingestion pipeline...\n')
-  console.log(`Sources: ${sources.join(', ')}`)
-  console.log(`Mode: ${since ? `incremental (since ${since})` : 'full sync'}\n`)
-
   await ensureCollection()
 
-  // 1. Fetch from all sources in parallel
-  const fetchPromises = []
-  if (sources.includes('notion'))
-    fetchPromises.push(fetchNotionDocuments(since))
-  if (sources.includes('confluence'))
-    fetchPromises.push(fetchConfluenceDocuments(since))
-  if (sources.includes('slack'))
-    fetchPromises.push(fetchSlackDocuments(since))
+  const totalStats = { documents: 0, chunks: 0 }
 
-  const results = await Promise.all(fetchPromises)
-  const allDocuments = results.flat()
+  for (const source of sources) {
+    console.log(`\n── Processing source: ${source} ──`)
 
-  if (allDocuments.length === 0) {
-    console.log('✅ Nothing new to ingest.')
-    return
+    // Auto-read last sync time for incremental mode
+    const since = incremental
+      ? await getLastSyncTime(source)
+      : options.since
+
+    if (since) {
+      console.log(`  Mode: incremental (since ${since})`)
+    } else {
+      console.log(`  Mode: full sync`)
+    }
+
+    try {
+      // Mark as running
+      await saveSyncState(source, 'success', { documents: 0, chunks: 0 })
+
+      // 1. Fetch
+      let documents = []
+      if (source === 'notion') documents = await fetchNotionDocuments(since)
+      if (source === 'confluence') documents = await fetchConfluenceDocuments(since)
+      if (source === 'slack') documents = await fetchSlackDocuments(since)
+
+      if (documents.length === 0) {
+        console.log(`  ✅ Nothing new for ${source}`)
+        continue
+      }
+
+      // 2. Chunk
+      const chunks = await chunkDocuments(documents)
+
+      // 3. Embed
+      const embeddedChunks = await embedChunks(chunks)
+
+      // 4. Upsert to Qdrant
+      await upsertToQdrant(embeddedChunks)
+
+      // 5. Register in DB
+      await registerDocuments(embeddedChunks)
+
+      // 6. Save sync state
+      await saveSyncState(source, 'success', {
+        documents: documents.length,
+        chunks: embeddedChunks.length,
+      })
+
+      totalStats.documents += documents.length
+      totalStats.chunks += embeddedChunks.length
+
+      console.log(`  ✅ ${source}: ${documents.length} docs, ${embeddedChunks.length} chunks`)
+    } catch (err) {
+      const message = (err as Error).message
+      console.error(`  ✗ ${source} failed: ${message}`)
+      await saveSyncState(source, 'failed', { documents: 0, chunks: 0 }, message)
+    }
   }
 
-  console.log(`📚 Total documents fetched: ${allDocuments.length}\n`)
-
-  // 2. Chunk
-  const chunks = await chunkDocuments(allDocuments)
-
-  // 3. Embed
-  const embeddedChunks = await embedChunks(chunks)
-
-  // 4. Upsert to Qdrant
-  await upsertToQdrant(embeddedChunks)
-
   console.log(`\n🎉 Pipeline complete!`)
-  console.log(`   Documents: ${allDocuments.length}`)
-  console.log(`   Chunks: ${chunks.length}`)
-  console.log(`   Vectors stored: ${embeddedChunks.length}`)
+  console.log(`   Total documents: ${totalStats.documents}`)
+  console.log(`   Total chunks: ${totalStats.chunks}`)
 }
