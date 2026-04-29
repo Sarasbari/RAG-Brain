@@ -143,12 +143,14 @@ export async function fetchNotionDocuments(
 
       documents.push({
         id: `notion-${page.id}`,
+        sourceType: 'notion',
+        sourceId: page.id,
         title,
         content,
         url,
-        source: 'notion',
-        lastEditedAt: page.last_edited_time,
+        lastModified: new Date(page.last_edited_time),
         author,
+        metadata: {},
       })
 
       console.log(`  ✓ ${title}`)

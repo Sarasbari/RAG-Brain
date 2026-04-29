@@ -1,6 +1,5 @@
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters'
 import { RawDocument, Chunk } from '@/types'
-import { v4 as uuid } from 'uuid'
 
 // Install uuid: npm install uuid @types/uuid
 
@@ -29,15 +28,19 @@ export async function chunkDocuments(
     texts.forEach((text, index) => {
       chunks.push({
         id: `${doc.id}-chunk-${index}`,
-        docId: doc.id,
+        documentId: doc.id,
         content: text,
+        tokenCount: Math.ceil(text.length / 4),
+        index,
         metadata: {
+          sourceType: doc.sourceType,
+          sourceId: doc.sourceId,
           title: doc.title,
           url: doc.url,
-          source: doc.source,
           author: doc.author,
-          lastEditedAt: doc.lastEditedAt,
+          lastModified: doc.lastModified.toISOString(),
           chunkIndex: index,
+          totalChunks: texts.length,
         },
       })
     })

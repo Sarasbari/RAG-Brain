@@ -90,12 +90,14 @@ async function fetchChannel(
 
     documents.push({
       id: `slack-${channelId}-${ts}`,
+      sourceType: 'slack',
+      sourceId: `${channelId}-${ts}`,
       title: `#${channelName} — ${new Date(date).toLocaleDateString()}`,
       content,
       url: `https://slack.com/app_redirect?channel=${channelId}&message_ts=${ts}`,
-      source: 'slack',
-      lastEditedAt: date,
+      lastModified: new Date(date),
       author,
+      metadata: {},
     })
   }
 

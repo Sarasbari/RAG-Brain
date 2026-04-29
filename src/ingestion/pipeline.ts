@@ -7,7 +7,7 @@ import { qdrant, COLLECTION_NAME, ensureCollection } from '@/lib/qdrant'
 import { db } from '@/db/client'
 import { syncState, documentRegistry } from '@/db/schema'
 import { eq } from 'drizzle-orm'
-import { EmbeddedChunk, SourceType } from '@/types'
+import { EmbeddedChunk, RawDocument, SourceType } from '@/types'
 
 const UPSERT_BATCH_SIZE = 100
 
@@ -24,7 +24,7 @@ async function upsertToQdrant(chunks: EmbeddedChunk[]) {
         vector: chunk.embedding,
         payload: {
           content: chunk.content,
-          docId: chunk.docId,
+          documentId: chunk.documentId,
           chunkId: chunk.id,
           ...chunk.metadata,
         },
@@ -92,12 +92,12 @@ async function saveSyncState(
 // ─── Register documents in DB for future deletion tracking ───────────────────
 
 async function registerDocuments(chunks: EmbeddedChunk[]) {
-  // Group chunks by docId
+  // Group chunks by documentId
   const docMap = new Map<string, EmbeddedChunk[]>()
   for (const chunk of chunks) {
-    const arr = docMap.get(chunk.docId) ?? []
+    const arr = docMap.get(chunk.documentId) ?? []
     arr.push(chunk)
-    docMap.set(chunk.docId, arr)
+    docMap.set(chunk.documentId, arr)
   }
 
   for (const [docId, docChunks] of docMap.entries()) {
@@ -106,10 +106,10 @@ async function registerDocuments(chunks: EmbeddedChunk[]) {
       .insert(documentRegistry)
       .values({
         id: docId,
-        source: first.metadata.source,
+        source: first.metadata.sourceType,
         title: first.metadata.title,
-        url: first.metadata.url,
-        lastEditedAt: new Date(first.metadata.lastEditedAt),
+        url: first.metadata.url ?? '',
+        lastEditedAt: new Date(first.metadata.lastModified),
         chunkCount: docChunks.length,
         qdrantPointIds: docChunks.map((c) => hashId(c.id)),
         indexedAt: new Date(),
@@ -117,7 +117,7 @@ async function registerDocuments(chunks: EmbeddedChunk[]) {
       .onConflictDoUpdate({
         target: documentRegistry.id,
         set: {
-          lastEditedAt: new Date(first.metadata.lastEditedAt),
+          lastEditedAt: new Date(first.metadata.lastModified),
           chunkCount: docChunks.length,
           qdrantPointIds: docChunks.map((c) => hashId(c.id)),
           indexedAt: new Date(),
@@ -162,7 +162,7 @@ export async function runPipeline(options: {
       await saveSyncState(source, 'success', { documents: 0, chunks: 0 })
 
       // 1. Fetch
-      let documents = []
+      let documents: RawDocument[] = []
       if (source === 'notion') documents = await fetchNotionDocuments(since)
       if (source === 'confluence') documents = await fetchConfluenceDocuments(since)
       if (source === 'slack') documents = await fetchSlackDocuments(since)

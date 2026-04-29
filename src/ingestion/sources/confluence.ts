@@ -85,12 +85,14 @@ export async function fetchConfluenceDocuments(
 
       documents.push({
         id: `confluence-${page.id}`,
+        sourceType: 'confluence',
+        sourceId: String(page.id),
         title: page.title,
         content: markdown,
         url,
-        source: 'confluence',
-        lastEditedAt: lastEdited,
+        lastModified: new Date(lastEdited),
         author,
+        metadata: {},
       })
 
       console.log(`  ✓ [${spaceKey}] ${page.title}`)
