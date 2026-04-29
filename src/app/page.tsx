@@ -36,7 +36,7 @@ function CitationList({ citations }: { citations: Citation[] }) {
       </p>
       <div className="flex flex-col gap-1.5">
         {citations.map((c) => (
-          
+          <a
             key={c.index}
             href={c.url}
             target="_blank"

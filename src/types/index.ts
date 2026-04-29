@@ -42,6 +42,26 @@ export interface EmbeddedChunk extends Chunk {
 
 // ─── Retrieval Types ───────────────────────────────────────────────
 
+export interface RetrievedChunk {
+  content: string;
+  score: number;
+  metadata: {
+    title: string;
+    url: string;
+    source: SourceType;
+    author: string;
+    lastEditedAt: string;
+    chunkIndex: number;
+  };
+}
+
+export interface Citation {
+  index: number;
+  title: string;
+  url: string;
+  source: SourceType;
+}
+
 export interface SearchResult {
   id: string;
   content: string;
