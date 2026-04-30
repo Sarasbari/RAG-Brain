@@ -29,6 +29,6 @@ export function generateStreamingAnswer(
       { role: 'user', content: userPrompt },
     ],
     temperature: 0.1,      // low temp = more faithful to context
-    maxTokens: 1024,
+    maxOutputTokens: 1024,
   })
 }

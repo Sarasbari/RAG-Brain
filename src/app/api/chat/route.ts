@@ -71,7 +71,7 @@ export async function POST(req: NextRequest) {
     })
 
     const stream = generateStreamingAnswer(query, chunks, history)
-    const response = stream.toDataStreamResponse()
+    const response = stream.toTextStreamResponse()
 
     // Collect full response text for Langfuse (async, doesn't block stream)
     let fullResponse = ''
@@ -97,13 +97,7 @@ export async function POST(req: NextRequest) {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        const text = decoder.decode(value)
-        const lines = text.split('\n')
-        for (const line of lines) {
-          if (line.startsWith('0:')) {
-            try { fullResponse += JSON.parse(line.slice(2)) } catch {}
-          }
-        }
+        fullResponse += decoder.decode(value, { stream: true })
       }
 
       generationSpan.end({ output: fullResponse })
