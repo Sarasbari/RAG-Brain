@@ -90,49 +90,11 @@ This repo fixes all of it.
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        INGESTION PIPELINE                        │
-│                                                                   │
-│  Notion API ──┐                                                   │
-│  Confluence ──┼──► Fetch Docs ──► Chunk (1024 tokens, 128 overlap)│
-│  Slack API ───┘        │                                          │
-│                        ▼                                          │
-│               Voyage AI Embeddings (voyage-3-lite)                │
-│                        │                                          │
-│                        ▼                                          │
-│               Qdrant Vector Store ◄──── Neon DB (sync state)     │
-└─────────────────────────────────────────────────────────────────┘
+<div align="center">
 
-┌─────────────────────────────────────────────────────────────────┐
-│                        QUERY PIPELINE                             │
-│                                                                   │
-│  User Query                                                       │
-│      │                                                            │
-│      ▼                                                            │
-│  rewriteQuery()  ◄── conversation history                        │
-│      │                                                            │
-│      ├── expandQuery()      → 3 rephrasings                      │
-│      └── generateHyDE()    → hypothetical ideal answer           │
-│      │                                                            │
-│      ▼                                                            │
-│  hybridSearch() × N queries (parallel)                            │
-│      ├── Dense search  (Voyage AI embeddings + cosine)           │
-│      └── Sparse search (BM25 keyword matching)                   │
-│      │                                                            │
-│      ▼                                                            │
-│  Reciprocal Rank Fusion  → merge + deduplicate                   │
-│      │                                                            │
-│      ▼                                                            │
-│  Cohere Rerank  → cross-encoder, top 6 of 20+                    │
-│      │                                                            │
-│      ▼                                                            │
-│  Groq (llama-3.3-70b)  → stream with citations                   │
-│      │                                                            │
-│      ├── Client  ◄── token stream via SSE                        │
-│      └── Langfuse ◄── trace via .tee()                           │
-└─────────────────────────────────────────────────────────────────┘
-```
+<img src="public/system-architecture.png" alt="RAG-Brain System Architecture" width="100%" />
+
+</div>
 
 ---
 
