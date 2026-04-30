@@ -431,7 +431,7 @@ export default function ChatPage() {
               onKeyDown={handleKeyDown}
               placeholder="Ask anything about your company..."
               disabled={isLoading}
-              className="w-full px-4 py-3 pr-12 rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 text-sm disabled:opacity-50 bg-gray-50 transition-all"
+              className="w-full px-4 py-3 pr-12 rounded-xl border border-gray-200 focus:outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 text-sm text-gray-900 placeholder:text-gray-400 disabled:opacity-50 bg-gray-50 transition-all"
             />
             <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-gray-300">
               ↵

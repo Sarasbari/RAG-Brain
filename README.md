@@ -34,7 +34,7 @@ Hybrid search · Cross-encoder reranking · HyDE · Multi-query expansion · Str
 
 <br/>
 
-[**Live Demo**](https://production-rag.vercel.app) · [**Architecture**](#architecture) · [**Quick Start**](#quick-start) · [**Benchmarks**](#benchmarks)
+[**Live Demo**](https://knowledge-brain-rag.vercel.app) · [**Architecture**](#architecture) · [**Quick Start**](#quick-start) · [**Benchmarks**](#benchmarks)
 
 <br/>
 
@@ -175,8 +175,8 @@ Evaluated on a 50-question golden dataset across Notion + Confluence + Slack con
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/yourusername/production-rag
-cd production-rag
+git clone https://github.com/Sarasbari/RAG-Brain
+cd RAG-Brain
 npm install
 ```
 
@@ -460,6 +460,6 @@ If this saved you days of research, consider giving it a ⭐
 
 <br/>
 
-**[⭐ Star on GitHub](https://github.com/yourusername/production-rag)**
+**[⭐ Star on GitHub](https://github.com/Sarasbari/RAG-Brain)**
 
 </div>
